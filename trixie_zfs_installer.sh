@@ -2,32 +2,47 @@
 #
 # Debian 13 (Trixie) — ZFS-on-root installer (UEFI only)
 #
-# Layout per selected disk:
+# Partition layout per selected disk:
 #   p1 600 MiB   EF00  EFI System Partition        -> /boot/efi (vfat)
 #   p2   3 GiB   8300  /boot                       -> ext4 (mdraid1 if >1 disk)
 #   p3   2 GiB   8200  swap                        -> random-key dm-crypt when encrypting
 #   p4   rest    BF00  rpool                       -> ZFS, native encryption
 #
-# Features:
-#   - No bpool: /boot is plain ext4, so rpool keeps all feature flags
-#   - atime=off + relatime=off, logbias=throughput on the pool root
-#   - Optional Xfce4 or KDE Plasma desktop, installed in-chroot so the machine
-#     boots straight to a graphical login, or deferred to first boot
-#   - Wi-Fi / audio / GPU firmware and drivers auto-detected from the live system
-#   - Root and user passwords collected up front and applied via chpasswd
+# Dataset layout:
+#   rpool/ROOT                                     (canmount=off, mountpoint=none)
+#   └── trixie                                     (/)  <- the boot environment
+#   rpool/data                                     (canmount=off, mountpoint=none)
+#   ├── home                                       (/home)
+#   │   ├── root                                   (/root)
+#   │   └── <username>                             (/home/<username>)
+#   ├── opt                                        (/opt)
+#   ├── srv                                        (/srv)
+#   └── var                                        (canmount=off, mountpoint=none)
+#       ├── lib                                    (canmount=off, mountpoint=none)
+#       │   ├── containers                         (/var/lib/containers)  Podman
+#       │   ├── docker                             (/var/lib/docker)      Docker
+#       │   ├── libvirt                            (/var/lib/libvirt)     VMs
+#       │   └── lxc                                (/var/lib/lxc)         LXC
+#       ├── log                                    (/var/log)
+#       ├── spool                                  (/var/spool)
+#       └── tmp                                    (/var/tmp)
+#
+# Everything under rpool/data is shared across boot environments, so rolling
+# back rpool/ROOT/<be> never reverts user data, logs, VMs or containers.
 #
 set -o pipefail
 
 ########################################################################
 # Tunables
 ########################################################################
+POOL_NAME="rpool"                   # change to zroot if you prefer
 TARGET_SUITE="trixie"
 BACKPORTS_SUITE="trixie-backports"
 DEB_MIRROR="http://deb.debian.org/debian"
 DEB_SECURITY_MIRROR="http://deb.debian.org/debian-security"
 DEB_COMPONENTS="main contrib non-free non-free-firmware"
 
-ROOT_DATASET_NAME="trixie"          # rpool/ROOT/${ROOT_DATASET_NAME}
+ROOT_DATASET_NAME="trixie"          # ${POOL_NAME}/ROOT/${ROOT_DATASET_NAME}
 DEFAULT_HOSTNAME="srv-deb13"
 LOCALE_GEN="it_IT.UTF-8 UTF-8"
 LOCALE_LANG="it_IT.UTF-8"
@@ -39,6 +54,9 @@ BOOT_SIZE="+3G"
 SWAP_SIZE="+2G"
 
 ZFS_COMPRESSION="lz4"               # zstd is also fine on Trixie's OpenZFS 2.3.x
+VM_RECORDSIZE="64K"                 # /var/lib/libvirt — raw images
+LOG_COMPRESSION="zstd"              # /var/log compresses far better with zstd
+
 EXTRA_PACKAGES="aptitude vim zsh screen tmux openssh-server sudo pciutils usbutils \
 debconf-utils ca-certificates curl rsync"
 
@@ -52,7 +70,6 @@ pipewire pipewire-pulse pipewire-alsa wireplumber pavucontrol"
 # No GPU or video drivers: X/Wayland uses the in-kernel KMS drivers, and audio
 # is handled entirely by PipeWire from the desktop package set above.
 FW_BASE="firmware-misc-nonfree wpasupplicant iw rfkill wireless-regdb"
-# Used for the "install everything" option.
 FW_ALL="firmware-iwlwifi firmware-realtek firmware-atheros firmware-brcm80211 \
 firmware-libertas firmware-mediatek firmware-ti-connectivity firmware-zd1211 \
 firmware-marvell-prestera firmware-qcom-soc"
@@ -111,6 +128,10 @@ read_password() {
 require_cmd lsblk sgdisk wipefs blkid partprobe udevadm mkfs.ext4 mkfs.vfat \
             debootstrap zpool zfs chroot awk sed
 
+if zpool list -H -o name 2>/dev/null | grep -qx "$POOL_NAME"; then
+    die "A pool named '${POOL_NAME}' is already imported. Export it first: zpool export ${POOL_NAME}"
+fi
+
 ########################################################################
 # Disk selection
 ########################################################################
@@ -158,19 +179,19 @@ CONFIRMATION=${CONFIRMATION,,}
 [[ "$CONFIRMATION" == "y" ]] || { echo "Operation canceled by the user. No disks have been modified."; exit 0; }
 echo "---"
 
-echo "Do you want to use ZFS native encryption for the main pool (rpool)?"
+echo "Do you want to use ZFS native encryption for the main pool (${POOL_NAME})?"
 echo "(Swap will then also be encrypted with a random key on every boot.)"
 read -rp "Enter 'y' for yes, 'n' for no (y/N): " ENCRYPT_CHOICE
 ENCRYPT_CHOICE=${ENCRYPT_CHOICE,,}
 echo "---"
 
-echo "rpool is created now by the live environment's OpenZFS:"
+echo "${POOL_NAME} is created now by the live environment's OpenZFS:"
 echo "  $(zfs version 2>/dev/null | head -1)"
 echo "The installed system will use OpenZFS from ${BACKPORTS_SUITE}, which is usually newer."
 echo "Any feature flags only the newer release supports can be enabled on first boot."
-echo "This is safe here — GRUB reads the ext4 /boot and never touches rpool — but"
+echo "This is safe here — GRUB reads the ext4 /boot and never touches ${POOL_NAME} — but"
 echo "afterwards the pool can no longer be imported by an older OpenZFS."
-read -rp "Run 'zpool upgrade rpool' on first boot? (y/N): " ZPOOL_UPGRADE
+read -rp "Run 'zpool upgrade ${POOL_NAME}' on first boot? (y/N): " ZPOOL_UPGRADE
 ZPOOL_UPGRADE=${ZPOOL_UPGRADE,,}
 [[ "$ZPOOL_UPGRADE" == "y" ]] || ZPOOL_UPGRADE="n"
 echo "---"
@@ -187,6 +208,7 @@ ROOT_PASSWORD="$(read_password "  root password")"
 echo "---"
 
 echo "A graphical login manager will not accept root, so a normal user is needed for a desktop."
+echo "The user gets a dedicated dataset at ${POOL_NAME}/data/home/<username>."
 read -rp "Username for the regular account (leave empty to skip): " NEW_USER
 NEW_USER="${NEW_USER// /}"
 if [ -n "$NEW_USER" ] && ! [[ "$NEW_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
@@ -313,7 +335,7 @@ RPOOL_PART=4
 
 RAID_TYPE=""
 if [ ${#SELECTED_DISKS[@]} -gt 1 ]; then
-    echo "You have selected multiple disks. How do you want to configure rpool?"
+    echo "You have selected multiple disks. How do you want to configure ${POOL_NAME}?"
     echo "1) Simple Mirror (raid1)"
     echo "2) RAID10 (striped mirrors)"
     echo "3) RAIDZ1"
@@ -350,8 +372,8 @@ for disk_path in "${SELECTED_DISKS[@]}"; do
     # p3: swap — 2 GiB
     sgdisk -n${SWAP_PART}:0:${SWAP_SIZE} -t${SWAP_PART}:8200 -c${SWAP_PART}:"swap" "$disk_path"
 
-    # p4: rpool — remainder
-    sgdisk -n${RPOOL_PART}:0:0 -t${RPOOL_PART}:BF00 -c${RPOOL_PART}:"rpool" "$disk_path"
+    # p4: pool — remainder
+    sgdisk -n${RPOOL_PART}:0:0 -t${RPOOL_PART}:BF00 -c${RPOOL_PART}:"${POOL_NAME}" "$disk_path"
 
     partprobe "$disk_path" || true
     echo "Partitioning on $disk_path completed."
@@ -361,7 +383,7 @@ udevadm settle
 sleep 2
 
 ########################################################################
-# rpool vdev specification
+# Pool vdev specification
 ########################################################################
 RPOOL_DEVICES=""
 if [ ${#SELECTED_DISKS[@]} -eq 1 ]; then
@@ -400,7 +422,7 @@ else
 fi
 
 ########################################################################
-# rpool creation
+# Pool creation
 ########################################################################
 ZPOOL_COMMON_OPTS=(
     -f
@@ -418,22 +440,66 @@ ZPOOL_COMMON_OPTS=(
 mkdir -p /etc/zfs
 
 if [[ "$ENCRYPT_CHOICE" == "y" ]]; then
-    echo "Creating rpool (ZFS native encryption)..."
+    echo "Creating ${POOL_NAME} (ZFS native encryption)..."
     echo "You will be asked for the pool passphrase now; the same one is requested at every boot."
     zpool create "${ZPOOL_COMMON_OPTS[@]}" \
         -O encryption=on -O keylocation=prompt -O keyformat=passphrase \
-        rpool ${RPOOL_DEVICES} || die "zpool create failed."
+        "$POOL_NAME" ${RPOOL_DEVICES} || die "zpool create failed."
 else
-    echo "Creating rpool (unencrypted)..."
+    echo "Creating ${POOL_NAME} (unencrypted)..."
     zpool create "${ZPOOL_COMMON_OPTS[@]}" \
-        rpool ${RPOOL_DEVICES} || die "zpool create failed."
+        "$POOL_NAME" ${RPOOL_DEVICES} || die "zpool create failed."
 fi
 
+########################################################################
+# Datasets
+########################################################################
+BE="${POOL_NAME}/ROOT/${ROOT_DATASET_NAME}"
+
 echo "---"
-echo "Creating datasets..."
-zfs create -o canmount=off -o mountpoint=none rpool/ROOT
-zfs create -o canmount=noauto -o mountpoint=/ "rpool/ROOT/${ROOT_DATASET_NAME}"
-zfs mount "rpool/ROOT/${ROOT_DATASET_NAME}"
+echo "Creating the boot environment..."
+zfs create -o canmount=off -o mountpoint=none "${POOL_NAME}/ROOT"      || die "zfs create ROOT failed."
+zfs create -o canmount=noauto -o mountpoint=/ "$BE"                    || die "zfs create BE failed."
+zfs mount "$BE"                                                        || die "Could not mount the boot environment."
+
+echo "Creating the shared data hierarchy..."
+# Container datasets: never mounted, exist only to group and to hold inherited
+# properties. Their children carry explicit mountpoints.
+zfs create -o canmount=off -o mountpoint=none "${POOL_NAME}/data"
+zfs create -o canmount=off -o mountpoint=none "${POOL_NAME}/data/var"
+zfs create -o canmount=off -o mountpoint=none "${POOL_NAME}/data/var/lib"
+
+zfs create -o mountpoint=/home  "${POOL_NAME}/data/home"
+zfs create -o mountpoint=/root  "${POOL_NAME}/data/home/root"
+if [ -n "$NEW_USER" ]; then
+    zfs create -o mountpoint="/home/${NEW_USER}" "${POOL_NAME}/data/home/${NEW_USER}"
+fi
+
+zfs create -o mountpoint=/opt "${POOL_NAME}/data/opt"
+zfs create -o mountpoint=/srv "${POOL_NAME}/data/srv"
+
+# Container and VM stores: excluded from automatic snapshots, since their
+# contents are large, churn constantly, and are reproducible.
+zfs create -o mountpoint=/var/lib/containers -o com.sun:auto-snapshot=false \
+    "${POOL_NAME}/data/var/lib/containers"
+zfs create -o mountpoint=/var/lib/docker     -o com.sun:auto-snapshot=false \
+    "${POOL_NAME}/data/var/lib/docker"
+zfs create -o mountpoint=/var/lib/lxc        -o com.sun:auto-snapshot=false \
+    "${POOL_NAME}/data/var/lib/lxc"
+# libvirt holds large raw images: a bigger recordsize cuts metadata overhead
+# and write amplification versus the 128K default for sequential VM I/O.
+zfs create -o mountpoint=/var/lib/libvirt    -o com.sun:auto-snapshot=false \
+    -o recordsize="${VM_RECORDSIZE}" "${POOL_NAME}/data/var/lib/libvirt"
+
+# Logs are highly compressible text; zstd typically beats lz4 by 2-3x here.
+zfs create -o mountpoint=/var/log   -o compression="${LOG_COMPRESSION}" \
+    "${POOL_NAME}/data/var/log"
+zfs create -o mountpoint=/var/spool "${POOL_NAME}/data/var/spool"
+zfs create -o mountpoint=/var/tmp   -o com.sun:auto-snapshot=false \
+    "${POOL_NAME}/data/var/tmp"
+
+echo "Dataset layout:"
+zfs list -o name,used,mountpoint,canmount -r "$POOL_NAME"
 
 ########################################################################
 # /boot (ext4), ESP (vfat), swap
@@ -494,10 +560,21 @@ debootstrap --arch=amd64 "${TARGET_SUITE}" /mnt "${DEB_MIRROR}" || die "debootst
 mkdir -p /mnt/etc/zfs
 cp /etc/zfs/zpool.cache /mnt/etc/zfs/ 2>/dev/null || true
 
+# ZFS creates mountpoint directories with 0755; a few need specific modes that
+# debootstrap cannot set, because the dataset is mounted over the directory.
+chmod 0700 /mnt/root
+chmod 1777 /mnt/var/tmp
+chmod 0755 /mnt/home /mnt/opt /mnt/srv
+chmod 0755 /mnt/var/log /mnt/var/spool
+
 ########################################################################
-# Credentials handed to the chroot out of band (never on the command line)
+# Credentials, handed over on tmpfs
+#
+# NOT written into the target filesystem: ZFS is copy-on-write, so `shred`
+# cannot overwrite the original blocks and the plaintext would survive on disk.
+# /mnt/run is a tmpfs, so this never leaves RAM.
 ########################################################################
-CRED_FILE="/mnt/root/.install-credentials"
+CRED_FILE="/mnt/run/.install-credentials"
 install -m 0600 /dev/null "$CRED_FILE"
 [ -n "$ROOT_PASSWORD" ] && printf 'root:%s\n' "$ROOT_PASSWORD" >> "$CRED_FILE"
 [ -n "$NEW_USER" ] && [ -n "$USER_PASSWORD" ] && printf '%s:%s\n' "$NEW_USER" "$USER_PASSWORD" >> "$CRED_FILE"
@@ -512,7 +589,8 @@ ESP_UUID=$(blkid -s UUID -o value "$PRIMARY_ESP")
 
 {
     echo "# <file system> <mount point> <type> <options> <dump> <pass>"
-    echo "# / is ZFS (rpool/ROOT/${ROOT_DATASET_NAME}) — managed by zfs-mount / zfs-list.cache"
+    echo "# / and all ZFS datasets are mounted from /etc/zfs/zfs-list.cache"
+    echo "# by zfs-mount-generator — do not add them here."
     echo "UUID=${BOOT_UUID} /boot ext4 defaults,noatime,nodev,nosuid 0 2"
     echo "UUID=${ESP_UUID} /boot/efi vfat defaults,noatime,umask=0077,nofail 0 1"
 } > /mnt/etc/fstab
@@ -606,6 +684,7 @@ set -o pipefail
 
 IFS=' ' read -r -a ESP_ARRAY <<< "$ESP_LIST_STR"
 export DEBIAN_FRONTEND=noninteractive
+BE="${POOL_NAME}/ROOT/${ROOT_DATASET_NAME}"
 
 # Install packages, silently skipping any that do not exist in the archive.
 apt_install_optional() {
@@ -727,17 +806,24 @@ apt install --yes ${EXTRA_PACKAGES}
 ########################################################################
 if [ -n "$NEW_USER" ]; then
     echo "Creating user '${NEW_USER}'..."
+    # The home directory already exists as a mounted dataset, so adduser will
+    # not populate it from /etc/skel — do that explicitly afterwards.
     adduser --disabled-password --gecos "${USER_GECOS}" "$NEW_USER"
     for GRP in sudo audio video netdev plugdev input render cdrom dialout bluetooth lpadmin scanner; do
         getent group "$GRP" >/dev/null && usermod -aG "$GRP" "$NEW_USER"
     done
+    if [ -d "/home/${NEW_USER}" ]; then
+        cp -a /etc/skel/. "/home/${NEW_USER}/" 2>/dev/null || true
+        chown -R "${NEW_USER}:${NEW_USER}" "/home/${NEW_USER}"
+        chmod 0755 "/home/${NEW_USER}"
+    fi
 fi
 
-if [ -s /root/.install-credentials ]; then
+if [ -s /run/.install-credentials ]; then
     echo "Applying passwords..."
-    chpasswd < /root/.install-credentials || echo "Warning: chpasswd failed." >&2
+    chpasswd < /run/.install-credentials || echo "Warning: chpasswd failed." >&2
 fi
-shred -u /root/.install-credentials 2>/dev/null || rm -f /root/.install-credentials
+rm -f /run/.install-credentials
 
 if ! passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^P$'; then
     echo "No root password was set. Set it now; you will be prompted twice."
@@ -870,17 +956,19 @@ fi
 echo "Enabling SSH login for root..."
 sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-echo "Setting zsh as default shell for root..."
-chsh -s /bin/zsh root
+if [ -x /bin/zsh ] || [ -x /usr/bin/zsh ]; then
+    echo "Setting zsh as default shell for root..."
+    chsh -s "$(command -v zsh)" root
+fi
 
 ########################################################################
 # GRUB (UEFI)
 ########################################################################
 echo "Configuring /etc/default/grub..."
 if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
-    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"root=ZFS=rpool/ROOT/${ROOT_DATASET_NAME}\"|" /etc/default/grub
+    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"root=ZFS=${BE}\"|" /etc/default/grub
 else
-    echo "GRUB_CMDLINE_LINUX=\"root=ZFS=rpool/ROOT/${ROOT_DATASET_NAME}\"" >> /etc/default/grub
+    echo "GRUB_CMDLINE_LINUX=\"root=ZFS=${BE}\"" >> /etc/default/grub
 fi
 # /boot is ext4; GRUB never needs to touch the encrypted pool.
 sed -i 's|^#\?GRUB_ENABLE_CRYPTODISK=.*|GRUB_ENABLE_CRYPTODISK=n|' /etc/default/grub
@@ -936,37 +1024,64 @@ if [ "${#ESP_ARRAY[@]}" -gt 1 ]; then
 fi
 
 ########################################################################
-# zfs-list.cache (required for correct mounting at boot)
+# zfs-list.cache
+#
+# zfs-mount-generator turns this file into systemd .mount units at boot. It is
+# what guarantees /var/log is mounted before journald writes to it, and
+# /var/lib/docker before the Docker service starts. An incomplete file here
+# means datasets silently shadow each other at runtime.
 ########################################################################
-echo "Generating /etc/zfs/zfs-list.cache/rpool..."
+echo "Generating /etc/zfs/zfs-list.cache/${POOL_NAME}..."
 mkdir -p /etc/zfs/zfs-list.cache
-touch /etc/zfs/zfs-list.cache/rpool
+touch "/etc/zfs/zfs-list.cache/${POOL_NAME}"
 
 zed -F &
 ZED_PID=$!
 sleep 3
-# Any property change on the pool makes zed rewrite the cache file.
-zfs set canmount=on  "rpool/ROOT/${ROOT_DATASET_NAME}"
+# Any property change on the pool makes zed rewrite the whole cache file.
+zfs set canmount=on     "$BE"
 sleep 2
-zfs set canmount=noauto "rpool/ROOT/${ROOT_DATASET_NAME}"
-sleep 2
+zfs set canmount=noauto "$BE"
+sleep 3
 kill "$ZED_PID" 2>/dev/null || true
 wait "$ZED_PID" 2>/dev/null || true
 
-if [ -s /etc/zfs/zfs-list.cache/rpool ]; then
-    sed -Ei "s|/mnt/?|/|" /etc/zfs/zfs-list.cache/rpool
-    echo "zfs-list.cache populated."
+CACHE="/etc/zfs/zfs-list.cache/${POOL_NAME}"
+if [ -s "$CACHE" ]; then
+    # Strip the /mnt altroot prefix. Anchored to the tab before the mountpoint
+    # field so a dataset name can never be rewritten by accident.
+    sed -Ei 's|\t/mnt/?|\t/|' "$CACHE"
+
+    # Every mountable dataset must appear by name, or it will not be mounted.
+    # A plain line count would give false positives, because the container
+    # datasets (canmount=off) are listed too.
+    MISSING=""
+    while IFS=$'\t' read -r DS CM; do
+        [ "$CM" = "off" ] && continue
+        grep -qP "^\Q${DS}\E\t" "$CACHE" || MISSING="${MISSING} ${DS}"
+    done < <(zfs list -H -o name,canmount -t filesystem -r "$POOL_NAME")
+
+    if [ -n "$MISSING" ]; then
+        echo "  WARNING: missing from the cache:${MISSING}" >&2
+        echo "           After first boot run: zfs set canmount=noauto ${BE}" >&2
+        echo "           then: systemctl daemon-reload" >&2
+    else
+        echo "  all mountable datasets are listed"
+    fi
+    echo "  mountpoints:"
+    awk -F'\t' '$3 != "off" {printf "    %-42s %s\n", $1, $2}' "$CACHE"
 else
-    echo "Warning: zfs-list.cache/rpool is empty. Run 'zfs set canmount=noauto rpool/ROOT/${ROOT_DATASET_NAME}' after first boot with zed running." >&2
+    echo "WARNING: ${CACHE} is empty. After first boot run:" >&2
+    echo "  zfs set canmount=noauto ${BE}" >&2
 fi
 
-zpool set cachefile=/etc/zfs/zpool.cache rpool
+zpool set cachefile=/etc/zfs/zpool.cache "$POOL_NAME"
 
 if [ "$ZPOOL_UPGRADE" = "y" ]; then
     echo "Enabling zpool-upgrade-firstboot.service..."
-    cat > /etc/systemd/system/zpool-upgrade-firstboot.service <<'EOF_ZPOOL_UNIT'
+    cat > /etc/systemd/system/zpool-upgrade-firstboot.service <<EOF_ZPOOL_UNIT
 [Unit]
-Description=Enable new ZFS feature flags on rpool after switching to the backports OpenZFS
+Description=Enable new ZFS feature flags on ${POOL_NAME} after switching to the backports OpenZFS
 Documentation=man:zpool-upgrade(8)
 After=zfs.target zfs-mount.service
 Requires=zfs.target
@@ -975,7 +1090,7 @@ ConditionPathExists=!/var/lib/zpool-upgrade.done
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/zpool upgrade rpool
+ExecStart=/usr/sbin/zpool upgrade ${POOL_NAME}
 ExecStartPost=/usr/bin/touch /var/lib/zpool-upgrade.done
 ExecStartPost=-/bin/systemctl disable zpool-upgrade-firstboot.service
 
@@ -997,6 +1112,7 @@ for d in "${SELECTED_DISKS[@]}"; do ESP_LIST+=("$(part_dev "$d" $EFI_PART)"); do
 echo "Entering chroot for final configuration..."
 chroot /mnt /usr/bin/env \
     ESP_LIST_STR="${ESP_LIST[*]}" \
+    POOL_NAME="$POOL_NAME" \
     ROOT_DATASET_NAME="$ROOT_DATASET_NAME" \
     LOCALE_GEN="$LOCALE_GEN" \
     LOCALE_LANG="$LOCALE_LANG" \
@@ -1032,11 +1148,23 @@ echo "---"
 ########################################################################
 echo "Starting cleanup and finalization phase..."
 
-grep -E ' /mnt(/|$)' /proc/mounts | awk '{print $2}' | sort -r | xargs -r -n1 umount -l || true
-zfs umount -a || true
+# Deepest paths first, so nested datasets unmount before their parents.
+grep -E ' /mnt(/|$)' /proc/mounts | awk '{print $2}' \
+    | awk '{print gsub(/\//,"/"), $0}' | sort -rn -k1 | cut -d' ' -f2- \
+    | xargs -r -n1 umount -l || true
+zfs unmount -a 2>/dev/null || true
 
 echo "Exporting ZFS pool..."
-zpool export rpool || echo "Warning: 'zpool export rpool' failed. Run it manually before rebooting."
+EXPORT_OK=0
+for attempt in 1 2 3; do
+    if zpool export "$POOL_NAME" 2>/dev/null; then EXPORT_OK=1; break; fi
+    echo "  export attempt ${attempt} failed, retrying..."
+    sleep 2
+done
+if [ "$EXPORT_OK" -ne 1 ]; then
+    echo "Warning: 'zpool export ${POOL_NAME}' failed. Something still holds the pool." >&2
+    echo "         Check with: lsof +D /mnt  ;  then run the export manually." >&2
+fi
 
 if [ -n "$MD_BOOT" ]; then
     mdadm --stop "$MD_BOOT" 2>/dev/null || true
@@ -1047,22 +1175,26 @@ echo "Installation complete (UEFI)."
 echo "  p1 /boot/efi : 600 MiB vfat"
 echo "  p2 /boot     : 3 GiB ext4 (${BOOT_FS_DEV})"
 echo "  p3 swap      : 2 GiB$( [[ "$ENCRYPT_CHOICE" == "y" ]] && echo ' (dm-crypt, random key per boot)' )"
-echo "  p4 /         : rpool/ROOT/${ROOT_DATASET_NAME}$( [[ "$ENCRYPT_CHOICE" == "y" ]] && echo ' (ZFS native encryption)' )"
-echo "  atime=off relatime=off logbias=throughput"
-echo "  zfs        : installed from ${BACKPORTS_SUITE} (pinned for future upgrades)"
-[ "$ZPOOL_UPGRADE" = "y" ] && echo "               'zpool upgrade rpool' runs on first boot"
-[ -n "$NEW_USER" ] && echo "  user       : ${NEW_USER} (sudo, audio, video, netdev, ...)"
+echo "  p4 pool      : ${POOL_NAME}$( [[ "$ENCRYPT_CHOICE" == "y" ]] && echo ' (ZFS native encryption)' )"
+echo ""
+echo "  boot env     : ${BE}"
+echo "  shared data  : ${POOL_NAME}/data/{home,opt,srv,var/*} — survives BE rollback"
+echo "  properties   : atime=off relatime=off logbias=throughput compression=${ZFS_COMPRESSION}"
+echo "                 /var/log compression=${LOG_COMPRESSION}, libvirt recordsize=${VM_RECORDSIZE}"
+echo "  zfs          : installed from ${BACKPORTS_SUITE} (pinned for future upgrades)"
+[ "$ZPOOL_UPGRADE" = "y" ] && echo "                 'zpool upgrade ${POOL_NAME}' runs on first boot"
+[ -n "$NEW_USER" ] && echo "  user         : ${NEW_USER} (own dataset at ${POOL_NAME}/data/home/${NEW_USER})"
 case "$DESKTOP" in
-    none) echo "  desktop    : none (headless)" ;;
+    none) echo "  desktop      : none (headless)" ;;
     *)
         case "$DESKTOP_WHEN" in
-            now)       echo "  desktop    : ${DESKTOP} installed, boots to ${DM_NAME} (graphical.target)" ;;
-            firstboot) echo "  desktop    : ${DESKTOP} installs automatically on first boot" ;;
-            manual)    echo "  desktop    : run 'install-desktop' as root after rebooting" ;;
+            now)       echo "  desktop      : ${DESKTOP} installed, boots to ${DM_NAME} (graphical.target)" ;;
+            firstboot) echo "  desktop      : ${DESKTOP} installs automatically on first boot" ;;
+            manual)    echo "  desktop      : run 'install-desktop' as root after rebooting" ;;
         esac
         ;;
 esac
-[ -n "${DRIVER_PKGS// /}" ] && echo "  firmware   : Wi-Fi / network firmware installed (no GPU drivers)"
+[ -n "${DRIVER_PKGS// /}" ] && echo "  firmware     : Wi-Fi / network firmware installed (no GPU drivers)"
 echo ""
 echo "Remove the live installation medium before rebooting."
 echo "---"
