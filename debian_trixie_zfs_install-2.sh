@@ -24,7 +24,7 @@ set -o pipefail
 TARGET_SUITE="trixie"
 DEB_MIRROR="http://deb.debian.org/debian"
 DEB_SECURITY_MIRROR="http://deb.debian.org/debian-security"
-DEB_COMPONENTS="main contrib non-free-firmware"
+DEB_COMPONENTS="main contrib non-free non-free-firmware"
 
 ROOT_DATASET_NAME="trixie"          # rpool/ROOT/${ROOT_DATASET_NAME}
 DEFAULT_HOSTNAME="srv-deb13"
