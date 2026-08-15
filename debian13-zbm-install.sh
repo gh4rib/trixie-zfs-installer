@@ -164,6 +164,17 @@ SWAP_CIPHER="${SWAP_CIPHER:-aes-xts-plain64}"
 SWAP_KEYSIZE="${SWAP_KEYSIZE:-512}"       # 512 = AES-256 in XTS mode
 SWAP_MAPPER="${SWAP_MAPPER:-cswap}"
 
+# Install cryptsetup-initramfs when the archive provides it. Debian's hook
+# works out for itself which crypttab targets are needed early -- only those
+# backing root or resume -- so a swap volume that is neither is left out and
+# costs nothing at boot. Having the package present means a LUKS volume added
+# later can be unlocked from the initramfs with no rebuild of anything else.
+#
+# Expect update-initramfs to print "cryptsetup: WARNING: Couldn't determine
+# root device". The OpenZFS guides call this out explicitly: cryptsetup cannot
+# introspect ZFS, and the message is harmless here.
+INSTALL_CRYPTSETUP_INITRAMFS="${INSTALL_CRYPTSETUP_INITRAMFS:-yes}"
+
 #--- ZFS ----------------------------------------------------------------------
 POOL_NAME="${POOL_NAME:-zroot}"
 # [DEVIATION] Guide uses $ID from /etc/os-release ("debian"). Named boot
@@ -502,6 +513,12 @@ if [[ -n "$POOL_COMPAT" ]]; then
 fi
 zpool create "${zpool_opts[@]}" -m none "$POOL_NAME" "$POOL_DEVICE"
 
+# A pool GUID is unique where its name is not. Re-importing by GUID means a
+# same-named pool on another disk can never be picked up by mistake.
+POOL_GUID="$(zpool get -H -o value guid "$POOL_NAME")"
+[[ -n "$POOL_GUID" ]] || die "Could not read the GUID of the new pool."
+echo "  pool GUID: ${POOL_GUID}"
+
 #------------------------------------------------------------------------------
 # [GUIDE] Create initial file systems
 #
@@ -560,7 +577,26 @@ fi
 
 log "Exporting and re-importing at /mnt"
 zpool export "$POOL_NAME"
-zpool import -N -R /mnt "$POOL_NAME"
+
+# [DEVIATION] Guide does: zpool import -N -R /mnt zroot
+# By NAME, that picks whichever pool of that name the scan finds first -- a
+# coin toss if a second pool shares the name, and the failure mode is
+# installing over the wrong pool. -d restricts the scan to the partition just
+# created; the GUID identifies the pool unambiguously.
+if ! zpool import -N -R /mnt -d "$POOL_DEVICE" "$POOL_GUID"; then
+	# Some setups do not accept a bare device path for -d. Widen the search to
+	# the by-id directory but keep identifying the pool by GUID, so the fallback
+	# is still incapable of grabbing a same-named pool.
+	warn "Import with -d ${POOL_DEVICE} failed; retrying against /dev/disk/by-id"
+	zpool import -N -R /mnt -d /dev/disk/by-id "$POOL_GUID" \
+		|| die "Could not import pool ${POOL_GUID}."
+fi
+
+IMPORTED_GUID="$(zpool get -H -o value guid "$POOL_NAME" 2>/dev/null || true)"
+if [[ "$IMPORTED_GUID" != "$POOL_GUID" ]]; then
+	die "Imported pool GUID '${IMPORTED_GUID}' does not match the pool just created."
+fi
+
 zfs load-key "$POOL_NAME"
 zfs mount "${POOL_NAME}/ROOT/${BE_NAME}"
 # [DEVIATION] Guide mounts zroot/home explicitly; with many datasets, mount -a
@@ -651,6 +687,7 @@ log "Writing chroot payload"
 	printf 'SWAP_CIPHER=%q\n'        "$SWAP_CIPHER"
 	printf 'SWAP_KEYSIZE=%q\n'       "$SWAP_KEYSIZE"
 	printf 'SWAP_MAPPER=%q\n'        "$SWAP_MAPPER"
+	printf 'INSTALL_CRYPTSETUP_INITRAMFS=%q\n'        "$INSTALL_CRYPTSETUP_INITRAMFS"
 	printf 'ZBM_INSTALL=%q\n'        "$ZBM_INSTALL"
 	printf 'ZBM_CMDLINE=%q\n'        "$ZBM_CMDLINE"
 	printf 'ZBM_TIMEOUT=%q\n'        "$ZBM_TIMEOUT"
@@ -670,6 +707,11 @@ log()  { printf '\n\033[1;36m -->\033[0m \033[1m%s\033[0m\n' "$*"; }
 warn() {
 	printf '\033[1;33m [!]\033[0m %s\n' "$*" >&2
 	printf '%s\n' "$*" >> "$WARNFILE"
+}
+die() {
+	warn "$*"
+	printf '\033[1;31m [X]\033[0m FATAL: %s\n' "$*" >&2
+	exit 1
 }
 
 export DEBIAN_FRONTEND=noninteractive
@@ -816,7 +858,24 @@ update-initramfs -c -k all
 #--- [DEVIATION] Encrypted swap -----------------------------------------------
 if [[ "$SWAP_MODE" != "none" ]]; then
 	log "Configuring swap (${SWAP_MODE})"
-	apt install -y cryptsetup
+	# --no-install-recommends so the dependency set stays deliberate rather than
+	# whatever Recommends happens to pull in; cryptsetup-initramfs is then added
+	# explicitly below if INSTALL_CRYPTSETUP_INITRAMFS says so.
+	apt install -y --no-install-recommends cryptsetup cryptsetup-bin
+	apt install -y systemd-cryptsetup 2>/dev/null || true
+
+	CSI_INSTALLED=no
+	if [[ "$INSTALL_CRYPTSETUP_INITRAMFS" == "yes" ]]; then
+		if apt-cache show cryptsetup-initramfs >/dev/null 2>&1; then
+			if apt install -y cryptsetup-initramfs; then
+				CSI_INSTALLED=yes
+			else
+				warn "cryptsetup-initramfs failed to install."
+			fi
+		else
+			warn "cryptsetup-initramfs is not in the archive; skipped."
+		fi
+	fi
 
 	SWAP_PARTUUID="$(blkid -s PARTUUID -o value "$SWAP_DEVICE")"
 	SWAP_BY_PARTUUID="/dev/disk/by-partuuid/${SWAP_PARTUUID}"
@@ -836,9 +895,19 @@ EOF
 
 		cryptsetup luksFormat --type luks2 --batch-mode \
 			--cipher "$SWAP_CIPHER" --key-size "$SWAP_KEYSIZE" \
-			--key-file /etc/cryptsetup-keys.d/swap.key "$SWAP_DEVICE"
+			--key-file /etc/cryptsetup-keys.d/swap.key "$SWAP_DEVICE" \
+			|| die "luksFormat failed on ${SWAP_DEVICE}."
 		cryptsetup open --key-file /etc/cryptsetup-keys.d/swap.key \
-			"$SWAP_DEVICE" "$SWAP_MAPPER"
+			"$SWAP_DEVICE" "$SWAP_MAPPER" \
+			|| die "Could not open the LUKS swap volume."
+		# udev runs in the live environment whose /dev is bind-mounted here, so
+		# the mapper node should appear; wait rather than assume.
+		for _i in 1 2 3 4 5 6 7 8 9 10; do
+			[[ -e "/dev/mapper/${SWAP_MAPPER}" ]] && break
+			sleep 1
+		done
+		[[ -e "/dev/mapper/${SWAP_MAPPER}" ]] \
+			|| die "/dev/mapper/${SWAP_MAPPER} never appeared."
 		mkswap -L swap "/dev/mapper/${SWAP_MAPPER}"
 
 		SWAP_UUID="$(blkid -s UUID -o value "$SWAP_DEVICE")"
@@ -848,7 +917,45 @@ EOF
 		cryptsetup close "$SWAP_MAPPER"
 	fi
 
-	echo "/dev/mapper/${SWAP_MAPPER}	none	swap	sw	0	0" >> /etc/fstab
+	# 'sw' alone is not enough: the fstab generator makes the .swap unit Require
+	# the mapper device, but nothing says the device only appears after
+	# systemd-cryptsetup@ runs -- so systemd can wait the full 90s
+	# DefaultTimeoutStartSec and then fail. nofail keeps a swap fault from
+	# blocking boot at all.
+	echo "/dev/mapper/${SWAP_MAPPER}	none	swap	sw,nofail,x-systemd.requires=systemd-cryptsetup@${SWAP_MAPPER}.service	0	0" >> /etc/fstab
+fi
+
+# Neither swap mode here supports resuming from hibernation. Without this the
+# boot waits 30s for a resume device that will never appear.
+mkdir -p /etc/initramfs-tools/conf.d
+echo "RESUME=none" > /etc/initramfs-tools/conf.d/resume
+
+# The initramfs was built before crypttab and RESUME existed, and installing
+# cryptsetup-initramfs adds a hook. Rebuild so all three are reflected.
+# "cryptsetup: WARNING: Couldn't determine root device" here is expected and
+# harmless: root is ZFS, which cryptsetup cannot introspect.
+if [[ "${CSI_INSTALLED:-no}" == "yes" || "${SWAP_MODE:-none}" != "none" ]]; then
+	log "Rebuilding initramfs after crypt/resume configuration"
+	update-initramfs -u -k all
+fi
+
+# The swap volume must NOT end up inside the initramfs. Its keyfile lives on the
+# root filesystem, which is not mounted that early, so an included target would
+# fall back to prompting for a passphrase that does not exist -- and the boot
+# would hang there. Debian's hook only pulls in targets backing root or resume,
+# and ours is neither, but root here is ZFS which the hook cannot introspect, so
+# verify rather than assume.
+if [[ "${CSI_INSTALLED:-no}" == "yes" && "${SWAP_MODE:-none}" != "none" ]]; then
+	for _img in /boot/initrd.img-*; do
+		[[ -f "$_img" ]] || continue
+		if lsinitramfs "$_img" 2>/dev/null | grep -q 'cryptroot/crypttab'; then
+			if lsinitramfs -l "$_img" 2>/dev/null | grep -q "$SWAP_MAPPER"; then
+				warn "${_img##*/} may contain the ${SWAP_MAPPER} crypt target."
+				warn "If boot stops asking for a passphrase, set CRYPTSETUP=n in"
+				warn "/etc/cryptsetup-initramfs/conf-hook and rerun update-initramfs -u -k all."
+			fi
+		fi
+	done
 fi
 
 #--- [GUIDE] Set ZFSBootMenu properties on datasets ---------------------------
@@ -975,8 +1082,35 @@ echo "root:${ROOT_PASSWORD}" | chpasswd
 # file from skel directory into it" and carries on -- silently leaving the
 # account with no .bashrc, .profile or .bash_logout. So use -M (never touch
 # the home directory) and install the skeleton by hand.
-useradd -M -d "/home/${ADMIN_USER}" -s /bin/bash \
-	-c "$ADMIN_FULLNAME" -G "${ADMIN_GROUPS},sudo" "$ADMIN_USER"
+# useradd ABORTS if any group in -G does not exist, which would leave the
+# system with no user account at all. Keep only groups that really exist.
+WANTED_GROUPS="${ADMIN_GROUPS},sudo"
+REAL_GROUPS=""
+IFS=',' read -ra _grps <<< "$WANTED_GROUPS"
+for _g in "${_grps[@]}"; do
+	[[ -z "$_g" ]] && continue
+	if getent group "$_g" >/dev/null 2>&1; then
+		REAL_GROUPS="${REAL_GROUPS:+${REAL_GROUPS},}${_g}"
+	else
+		echo "    skip (no such group): ${_g}"
+	fi
+done
+
+# useradd -G "" is an error, so drop the flag entirely if nothing survived.
+if [[ -n "$REAL_GROUPS" ]]; then
+	useradd -M -d "/home/${ADMIN_USER}" -s /bin/bash \
+		-c "$ADMIN_FULLNAME" -G "$REAL_GROUPS" "$ADMIN_USER"
+else
+	warn "No supplementary groups exist; creating ${ADMIN_USER} without any."
+	useradd -M -d "/home/${ADMIN_USER}" -s /bin/bash \
+		-c "$ADMIN_FULLNAME" "$ADMIN_USER"
+fi
+
+# sudo is the one group that must be there. If it went missing the account
+# would be unable to administer the machine, and root login is the only way back.
+if ! id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx sudo; then
+	warn "${ADMIN_USER} is NOT in the sudo group. Use the root account to fix this."
+fi
 cp -a /etc/skel/. "/home/${ADMIN_USER}/"
 echo "${ADMIN_USER}:${ADMIN_PASSWORD}" | chpasswd
 chown -R "${ADMIN_USER}:${ADMIN_USER}" "/home/${ADMIN_USER}"
