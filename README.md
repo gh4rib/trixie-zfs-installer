@@ -1,6 +1,6 @@
 # trixie-zfs-installer
 
-Two unattended installers for **Debian 13 (Trixie) with root on encrypted ZFS**, each faithful to a different upstream guide:
+Two installers for **Debian 13 (Trixie) with root on encrypted ZFS**, each with a different upstream guide:
 
 | Script | Bootloader | `/boot` | Upstream guide |
 |---|---|---|---|
