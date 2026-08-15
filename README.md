@@ -24,7 +24,7 @@ Every step is tagged in the source with `[GUIDE]` (straight from the upstream do
 
 ## Table of contents
 
-- [Which one should I use?](#which-one-should-i-use)
+- [Introduction](#introduction)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Disk layouts](#disk-layouts)
@@ -41,9 +41,7 @@ Every step is tagged in the source with `[GUIDE]` (straight from the upstream do
 
 ---
 
-## Which one should I use?
-
-Neither is "better". They fail differently, and that is the real decision.
+# Introduction
 
 ### `debian13-zbm-install.sh` — ZFSBootMenu
 
@@ -60,11 +58,6 @@ GRUB reads the kernel and initramfs from a plain ext4 `/boot`. It never touches 
 **Choose it if** you want the boring, maximally robust option. Because GRUB never reads the root pool, `zpool upgrade rpool` is **always safe**, forever. Any Debian live ISO can rescue the system with no special tooling. This is also the closest thing to a "normal" Debian install that still has root on ZFS.
 
 **The cost:** boot environments are not interactive. The script generates a GRUB entry for `baseline`, but switching to an arbitrary snapshot means editing the kernel command line at the GRUB prompt or booting a live ISO.
-
-### Short version
-
-> Want to roll back a broken upgrade from a menu at boot? **ZFSBootMenu.**
-> Want to never think about bootloader/pool compatibility again? **GRUB.**
 
 ---
 
