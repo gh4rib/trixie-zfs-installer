@@ -203,7 +203,7 @@ DATASET_TUNING="${DATASET_TUNING:-yes}"
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-debian-zbm}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_FULLNAME="${ADMIN_FULLNAME:-System Administrator}"
-ADMIN_GROUPS="${ADMIN_GROUPS:-adm,cdrom,dip,plugdev,users,audio,video,netdev,lpadmin}"
+ADMIN_GROUPS="${ADMIN_GROUPS:-adm,cdrom,dip,plugdev,users,audio,video,netdev}"
 
 #--- Locale / time / keyboard -------------------------------------------------
 TIMEZONE="${TIMEZONE:-Etc/UTC}"
