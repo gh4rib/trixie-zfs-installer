@@ -193,7 +193,7 @@ SWAP_SIZE_MIB="${SWAP_SIZE_MIB:-1024}"
 # none   : no swap partition at all
 #
 # Either way hibernation is not configured; RESUME=none is set below.
-SWAP_MODE="${SWAP_MODE:-luks}"
+SWAP_MODE="${SWAP_MODE:-random}"
 SWAP_RANDOM_SOURCE="${SWAP_RANDOM_SOURCE:-/dev/urandom}"
 SWAP_CIPHER="${SWAP_CIPHER:-aes-xts-plain64}"
 SWAP_KEYSIZE="${SWAP_KEYSIZE:-512}"
@@ -242,7 +242,7 @@ COMPONENTS="${COMPONENTS:-main contrib non-free non-free-firmware}"
 
 ENABLE_UPDATES="${ENABLE_UPDATES:-yes}"       # ${SUITE}-updates
 ENABLE_SECURITY="${ENABLE_SECURITY:-yes}"     # ${SUITE}-security
-ENABLE_BACKPORTS="${ENABLE_BACKPORTS:-no}"    # enable later, by hand
+ENABLE_BACKPORTS="${ENABLE_BACKPORTS:-yes}"    # enable later, by hand
 # ${SUITE}-proposed-updates holds packages QUEUED FOR THE NEXT POINT RELEASE.
 # Unlike backports it has NORMAL priority, so enabling it means apt WILL pull
 # from it on the next upgrade. That is the point of a testing rig, but know
@@ -541,7 +541,7 @@ apt update
 
 log "Installing ZFS and helpers in the live environment (DKMS build, be patient)"
 apt install -y debootstrap gdisk dkms "linux-headers-$(uname -r)" cryptsetup curl ca-certificates
-apt install -y zfsutils-linux zfs-dkms
+apt install -y -t trixie-backports zfsutils-linux zfs-dkms
 modprobe zfs || die "zfs module failed to load in the live environment."
 
 # [GUIDE] Generate /etc/hostid
@@ -647,7 +647,9 @@ zpool_opts=(
 	-O "compression=${COMPRESSION}"
 	-O acltype=posixacl
 	-O xattr=sa
-	-O relatime=on
+	-O relatime=off
+	-O atime=off
+	-O logbias=throughput
 	-O "encryption=${ENCRYPTION_ALGO}"
 	-O "keylocation=file://${KEYFILE}"
 	-O keyformat=passphrase
@@ -682,7 +684,10 @@ zfs create -o mountpoint=/opt                    "${POOL_NAME}/data/opt"
 zfs create -o mountpoint=/srv                    "${POOL_NAME}/data/srv"
 zfs create -o mountpoint=none -o canmount=off    "${POOL_NAME}/data/var"
 zfs create -o mountpoint=none -o canmount=off    "${POOL_NAME}/data/var/lib"
+zfs create -o mountpoint=none -o canmount=off    "${POOL_NAME}/data/usr"
+zfs create -o mountpoint=/usr/local              "${POOL_NAME}/data/usr/local"
 zfs create -o mountpoint=/var/lib/containers     "${POOL_NAME}/data/var/lib/containers"
+zfs create -o mountpoint=/var/lib/containerd     "${POOL_NAME}/data/var/lib/containerd"
 zfs create -o mountpoint=/var/lib/docker         "${POOL_NAME}/data/var/lib/docker"
 zfs create -o mountpoint=/var/lib/libvirt        "${POOL_NAME}/data/var/lib/libvirt"
 zfs create -o mountpoint=/var/lib/lxc            "${POOL_NAME}/data/var/lib/lxc"
