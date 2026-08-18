@@ -234,8 +234,8 @@ KEYBOARD_VARIANT="${KEYBOARD_VARIANT-${_LIVE_XKBVARIANT}}"
 
 #--- Debian sources -----------------------------------------------------------
 SUITE="${SUITE:-trixie}"
-MIRROR="${MIRROR:-http://deb.debian.org/debian}"
-SECURITY_MIRROR="${SECURITY_MIRROR:-http://security.debian.org/debian-security}"
+MIRROR="${MIRROR:-https://deb.debian.org/debian}"
+SECURITY_MIRROR="${SECURITY_MIRROR:-https://security.debian.org/debian-security}"
 # non-free is included here (not just non-free-firmware): it is what provides
 # intel-media-va-driver-non-free and similar.
 COMPONENTS="${COMPONENTS:-main contrib non-free non-free-firmware}"
@@ -918,8 +918,8 @@ dpkg-reconfigure -f noninteractive keyboard-configuration console-setup
 #--- [GUIDE] Kernel and ZFS ---------------------------------------------------
 log "Installing kernel and ZFS"
 mkdir -p /etc/dkms
-apt install -y linux-headers-amd64 linux-image-amd64 zfs-initramfs dosfstools
-apt install -y zfs-zed
+apt install -y linux-headers-amd64 linux-image-amd64 dosfstools dkms
+apt install -y -t trixie-backports zfsutils-linux zfs-dkms  zfs-zed zfs-initramfs 
 echo "REMAKE_INITRD=yes" > /etc/dkms/zfs.conf
 
 #--- Microcode and firmware ---------------------------------------------------
@@ -1090,7 +1090,8 @@ mount /boot/efi
 #==============================================================================
 
 log "Downloading ZFSBootMenu ${ZBM_VERSION} images"
-apt install -y curl ca-certificates
+apt install -y -t trixie-backports curl 
+apt install -y ca-certificates
 
 # fetch_zbm <build> <kernel> <destination>
 #   build = release | recovery
