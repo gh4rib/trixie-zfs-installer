@@ -5,6 +5,7 @@ Two installers for **Debian 13 (Trixie) with root on encrypted ZFS**, each with 
 | Script | Bootloader | `/boot` | Upstream guide |
 |---|---|---|---|
 | `debian13-zbm-install.sh` | rEFInd → **ZFSBootMenu** | on the ZFS root dataset | [ZFSBootMenu — Debian (UEFI)](https://docs.zfsbootmenu.org/en/v3.1.x/guides/debian/uefi.html) |
+| `debian13-zbm-install-testing.sh` | rEFInd → **ZFSBootMenu** | on the ZFS root dataset | [ZFSBootMenu — Debian (UEFI)](https://docs.zfsbootmenu.org/en/v3.1.x/guides/debian/uefi.html) |
 | `debian13-root-on-zfs-grub.sh` | **GRUB** | separate **ext4** partition | [OpenZFS — Debian Trixie Root on ZFS](https://openzfs.github.io/openzfs-docs/Getting%20Started/Debian/Debian%20Trixie%20Root%20on%20ZFS.html) |
 
 Both scripts:
